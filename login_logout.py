@@ -2,7 +2,7 @@ import os
 import re
 import sys
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 def must_get_env(name: str) -> str:
@@ -12,7 +12,14 @@ def must_get_env(name: str) -> str:
     return v
 
 
-def main() -> None:
+def is_visible(locator):
+    try:
+        return locator.first.is_visible(timeout=1000)
+    except Exception:
+        return False
+
+
+def main():
     load_dotenv()
 
     base_url = must_get_env("BASE_URL")
@@ -20,47 +27,73 @@ def main() -> None:
     password = must_get_env("PASSWORD")
 
     timeout_ms = int(os.getenv("TIMEOUT_MS", "180000"))
-    headless = os.getenv("HEADLESS", "1") != "0"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(viewport={"width": 1400, "height": 900})
+        browser = p.chromium.launch(headless=True)
+
+        context = browser.new_context(
+            viewport={"width": 1400, "height": 900}
+        )
+
         page = context.new_page()
         page.set_default_timeout(timeout_ms)
 
         try:
-            # 1) Open the Streamlit share wrapper page
             page.goto(base_url, wait_until="domcontentloaded")
 
-            # 2) Target the embedded app iframe
-            app_frame = page.frame_locator('iframe[title="streamlitApp"]')
+            app = page.frame_locator('iframe[title="streamlitApp"]')
 
-            # 3) Wait for login form INSIDE the iframe
-            email_input = app_frame.locator('input[aria-label="Email"]').first
-            pwd_input = app_frame.locator('input[aria-label="Password"]').first
+            email_input = app.locator('input[aria-label="Email"]').first
+            pwd_input = app.locator('input[aria-label="Password"]').first
+
+            sign_in_button = app.get_by_role(
+                "button",
+                name=re.compile(r"^Sign in$", re.I)
+            ).first
+
+            logout_button = app.get_by_role(
+                "button",
+                name=re.compile(r"^Logout$", re.I)
+            ).first
+
+            signed_in_text = app.get_by_text("Signed in as").first
+            running_text = app.get_by_text("Running").first
 
             email_input.wait_for(state="visible", timeout=timeout_ms)
             pwd_input.wait_for(state="visible", timeout=timeout_ms)
 
-            # 4) Login
             email_input.fill(username)
             pwd_input.fill(password)
-            app_frame.get_by_role("button", name=re.compile(r"^Sign in$", re.I)).click()
 
-            # 5) Verify logged in (sidebar text + Logout button inside iframe)
-            try:
-                app_frame.get_by_text("Signed in as").wait_for(state="visible", timeout=timeout_ms)
-                app_frame.get_by_role("button", name=re.compile(r"^Logout$", re.I)).wait_for(
-                    state="visible", timeout=timeout_ms
+            sign_in_button.click()
+
+            page.wait_for_timeout(3000)
+
+            login_ok = False
+
+            for _ in range(45):
+                if is_visible(signed_in_text) and is_visible(logout_button):
+                    login_ok = True
+                    break
+
+                page.wait_for_timeout(1000)
+
+            if not login_ok:
+                still_on_login = is_visible(sign_in_button) and is_visible(email_input)
+                running_visible = is_visible(running_text)
+                logout_visible = is_visible(logout_button)
+                signed_in_visible = is_visible(signed_in_text)
+
+                raise RuntimeError(
+                    "Login verification failed. "
+                    f"still_on_login={still_on_login}, "
+                    f"running_visible={running_visible}, "
+                    f"signed_in_visible={signed_in_visible}, "
+                    f"logout_visible={logout_visible}"
                 )
-            except PlaywrightTimeoutError:
-                raise RuntimeError("Login verification failed (did not see 'Signed in as' and 'Logout').")
 
-            # 6) Logout
-            app_frame.get_by_role("button", name=re.compile(r"^Logout$", re.I)).click()
+            logout_button.click()
 
-            # 7) Verify logged out (email field visible again)
-            email_input = app_frame.locator('input[aria-label="Email"]').first
             email_input.wait_for(state="visible", timeout=timeout_ms)
 
             print("✅ Login and logout completed successfully.")
